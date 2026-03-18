@@ -1,9 +1,5 @@
 /// Ingestion loop: connects to a rusty-kaspa node via wRPC and polls
-/// the virtual chain for accepted blocks and transactions.
-///
-/// Supports two modes:
-/// - VSPCv2 (v1.1.0+): single call with full tx data
-/// - V1 fallback (v1.0.x): get_virtual_chain_from_block + get_blocks
+/// the virtual chain for accepted blocks and transactions using VSPCv2.
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -168,24 +164,7 @@ async fn connect_and_ingest(
     );
     metrics.connected.store(true, Ordering::Relaxed);
 
-    // Detect VSPCv2 support by checking server version
-    let version_parts: Vec<u32> = server_info
-        .server_version
-        .split('.')
-        .filter_map(|s| s.parse().ok())
-        .collect();
-    let supports_v2 = version_parts.len() >= 2 && (version_parts[0] > 1 || (version_parts[0] == 1 && version_parts[1] >= 1));
-
-    if supports_v2 {
-        info!("Node supports VSPCv2 — using single-call mode");
-        ingest_vspc_v2(&client, config, event_tx, metrics, sequence, poll_interval, resume_hash).await
-    } else {
-        info!(
-            "Node v{} does not support VSPCv2 — using v1 fallback (two-call mode)",
-            server_info.server_version
-        );
-        ingest_v1_fallback(&client, config, event_tx, metrics, sequence, poll_interval, resume_hash).await
-    }
+    ingest_vspc_v2(&client, config, event_tx, metrics, sequence, poll_interval, resume_hash).await
 }
 
 /// VSPCv2 mode: single get_virtual_chain_from_block_v2 call with Full verbosity
@@ -261,106 +240,6 @@ async fn ingest_vspc_v2(
             }
             Err(e) => {
                 error!("VSPCv2 poll error: {}", e);
-                return Err(e.into());
-            }
-        }
-
-        tokio::time::sleep(poll_interval).await;
-    }
-}
-
-/// V1 fallback: get_virtual_chain_from_block (tx IDs only) + get_blocks (full data)
-async fn ingest_v1_fallback(
-    client: &KaspaRpcClient,
-    config: &Config,
-    event_tx: &broadcast::Sender<proto::IngestorEvent>,
-    metrics: &Arc<IngestorMetrics>,
-    sequence: &mut u64,
-    poll_interval: Duration,
-    resume_hash: Option<&str>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut start_hash: RpcHash = if let Some(hash_str) = resume_hash {
-        RpcHash::from_str(hash_str)?
-    } else {
-        let sink = client.get_sink().await?;
-        sink.sink
-    };
-    info!("V1 fallback starting from {}: {}", if resume_hash.is_some() { "checkpoint" } else { "sink" }, start_hash);
-
-    let checkpoint_enabled = !config.ingest.checkpoint_path.is_empty();
-    let checkpoint_interval = Duration::from_secs(config.ingest.checkpoint_interval_secs);
-    let mut last_checkpoint = Instant::now();
-
-    loop {
-        // Step 1: Get virtual chain changes (accepted tx IDs only)
-        match client
-            .get_virtual_chain_from_block(start_hash, true, None)
-            .await
-        {
-            Ok(vc_response) => {
-                let added = vc_response.added_chain_block_hashes.len();
-                let removed = vc_response.removed_chain_block_hashes.len();
-
-                if added > 0 || removed > 0 {
-                    if let Some(last) = vc_response.added_chain_block_hashes.last() {
-                        start_hash = *last;
-                    }
-
-                    // Handle reorgs
-                    if removed > 0 {
-                        let reorg_event = normalize::make_reorg_event(
-                            &vc_response.removed_chain_block_hashes,
-                            sequence,
-                        );
-                        let _ = event_tx.send(reorg_event);
-                        warn!("Reorg: {} blocks removed", removed);
-                    }
-
-                    // Step 2: Fetch full block data for each added chain block
-                    let mut total_txs: usize = 0;
-                    for accepted in &vc_response.accepted_transaction_ids {
-                        let block_hash = accepted.accepting_block_hash;
-
-                        // Get the full block with transactions
-                        match client.get_block(block_hash, true).await {
-                            Ok(block) => {
-                                let tx_count = block.transactions.len();
-                                total_txs += tx_count;
-
-                                let event = normalize::normalize_block_v1(
-                                    &block,
-                                    &accepted.accepted_transaction_ids,
-                                    sequence,
-                                );
-                                let _ = event_tx.send(event);
-                            }
-                            Err(e) => {
-                                warn!("Failed to get block {}: {}", block_hash, e);
-                            }
-                        }
-                    }
-
-                    metrics.blocks_processed.fetch_add(added as u64, Ordering::Relaxed);
-                    metrics.txs_processed.fetch_add(total_txs as u64, Ordering::Relaxed);
-
-                    info!(
-                        "Processed {} blocks, {} txs (seq: {})",
-                        added, total_txs, sequence
-                    );
-
-                    // Periodic checkpoint
-                    if checkpoint_enabled && last_checkpoint.elapsed() >= checkpoint_interval {
-                        Checkpoint::save(
-                            &config.ingest.checkpoint_path,
-                            &start_hash.to_string(),
-                            *sequence,
-                        );
-                        last_checkpoint = Instant::now();
-                    }
-                }
-            }
-            Err(e) => {
-                error!("V1 virtual chain poll error: {}", e);
                 return Err(e.into());
             }
         }

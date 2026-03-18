@@ -91,15 +91,6 @@ Health check. Returns an empty response.
 
 Returns current ingestor state: version, node URL, connection status, DAA score, block/tx counts, and number of connected gRPC clients.
 
-## VSPCv2 vs V1 Fallback
-
-The ingestor auto-detects the node version on connect:
-
-- **VSPCv2** (rusty-kaspa v1.1.0+): Uses `get_virtual_chain_from_block_v2` which returns accepted chain blocks with full transaction data and resolved UTXO entries in a single call. This is the preferred mode.
-- **V1 fallback** (rusty-kaspa v1.0.x): Uses `get_virtual_chain_from_block` (returns only transaction IDs) followed by `get_block` for each accepted chain block. No UTXO entry data is available in this mode.
-
-The consumer-facing gRPC schema is identical in both modes. The only difference is that `utxo_entry` fields on transaction inputs will be empty in V1 mode.
-
 ## Connect as a Consumer
 
 Using `grpcurl`:
