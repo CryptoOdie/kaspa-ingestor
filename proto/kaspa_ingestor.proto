@@ -1,0 +1,137 @@
+syntax = "proto3";
+
+package kaspa.ingestor;
+
+// === SERVICE ===
+
+service KaspaIngestor {
+  // Bidirectional stream: client sends subscription request, server streams events
+  rpc Subscribe(stream SubscribeRequest) returns (stream IngestorEvent);
+
+  // Health check
+  rpc Ping(PingRequest) returns (PingResponse);
+
+  // Current ingestor status
+  rpc GetStatus(StatusRequest) returns (StatusResponse);
+}
+
+// === SUBSCRIBE ===
+
+message SubscribeRequest {
+  // Empty for now — subscribe to everything.
+  // Future: filters (block-only, tx-only, address set, etc.)
+}
+
+// === EVENTS ===
+
+message IngestorEvent {
+  uint64 sequence = 1;  // Monotonic sequence number for ordering / gap detection
+  uint64 timestamp_ms = 2;  // When the ingestor produced this event
+
+  oneof event {
+    ChainBlockEvent chain_block = 10;
+    ReorgEvent reorg = 11;
+    StatusEvent status = 12;
+  }
+}
+
+// A chain block with its accepted transactions (from VSPCv2)
+message ChainBlockEvent {
+  bytes block_hash = 1;
+  BlockHeader header = 2;
+  repeated AcceptedTransaction accepted_transactions = 3;
+}
+
+// Virtual chain reorg — blocks removed from the virtual selected parent chain
+message ReorgEvent {
+  repeated bytes removed_block_hashes = 1;
+}
+
+// Periodic status heartbeat
+message StatusEvent {
+  uint64 virtual_daa_score = 1;
+  uint64 sink_blue_score = 2;
+  uint64 blocks_processed = 3;
+  uint64 txs_processed = 4;
+}
+
+// === BLOCK HEADER ===
+
+message BlockHeader {
+  bytes hash = 1;
+  uint32 version = 2;
+  repeated ParentLevel parents_by_level = 3;
+  bytes hash_merkle_root = 4;
+  bytes accepted_id_merkle_root = 5;
+  bytes utxo_commitment = 6;
+  uint64 timestamp_ms = 7;
+  uint32 bits = 8;
+  uint64 nonce = 9;
+  uint64 daa_score = 10;
+  bytes blue_work = 11;
+  uint64 blue_score = 12;
+  bytes pruning_point = 13;
+}
+
+message ParentLevel {
+  repeated bytes parent_hashes = 1;
+}
+
+// === TRANSACTION ===
+
+message AcceptedTransaction {
+  bytes transaction_id = 1;
+  bytes hash = 2;
+  uint32 version = 3;
+  repeated TransactionInput inputs = 4;
+  repeated TransactionOutput outputs = 5;
+  uint64 lock_time = 6;
+  bytes subnetwork_id = 7;
+  uint64 gas = 8;
+  bytes payload = 9;
+  uint64 mass = 10;
+  uint64 block_time = 11;
+}
+
+message TransactionInput {
+  uint32 index = 1;
+  bytes previous_outpoint_hash = 2;
+  uint32 previous_outpoint_index = 3;
+  bytes signature_script = 4;
+  uint64 sequence = 5;
+  uint32 sig_op_count = 6;
+  // Resolved input data (from VSPCv2 Full verbosity)
+  UtxoEntry utxo_entry = 7;
+}
+
+message TransactionOutput {
+  uint32 index = 1;
+  uint64 amount = 2;
+  bytes script_public_key = 3;
+  uint32 script_public_key_version = 4;
+  string address = 5;  // Kaspa address string (kaspa:qr...)
+}
+
+message UtxoEntry {
+  uint64 amount = 1;
+  bytes script_public_key = 2;
+  uint64 block_daa_score = 3;
+  bool is_coinbase = 4;
+  string address = 5;
+}
+
+// === PING / STATUS ===
+
+message PingRequest {}
+message PingResponse {}
+
+message StatusRequest {}
+message StatusResponse {
+  string version = 1;
+  string node_url = 2;
+  bool connected = 3;
+  uint64 virtual_daa_score = 4;
+  uint64 blocks_processed = 5;
+  uint64 txs_processed = 6;
+  uint64 connected_clients = 7;
+}

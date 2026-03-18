@@ -1,0 +1,19 @@
+[node]
+# wRPC URL of a rusty-kaspa node
+url = "wss://wrpc.kasia.fyi"
+# Network: "mainnet", "testnet-10", "testnet-11"
+network = "mainnet"
+
+[grpc]
+# Address for the gRPC streaming server
+bind_address = "0.0.0.0:50051"
+
+[ingest]
+# VSPCv2 polling interval in milliseconds
+poll_interval_ms = 100
+# Tip distance (confirmation safety margin)
+tip_distance = 5
+# Checkpoint file path (set to "" to disable)
+checkpoint_path = "checkpoint.json"
+# How often to save checkpoint (seconds)
+checkpoint_interval_secs = 60

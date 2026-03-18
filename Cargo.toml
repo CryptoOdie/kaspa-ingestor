@@ -1,0 +1,37 @@
+[package]
+name = "kaspa-ingestor"
+version = "0.1.0"
+edition = "2021"
+description = "Un-opinionated Kaspa blockchain data ingestor with gRPC streaming output"
+license = "MIT"
+
+[dependencies]
+# Kaspa RPC client (same versions as simply-kaspa-indexer)
+kaspa-wrpc-client = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v1.1.0" }
+kaspa-rpc-core = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v1.1.0" }
+kaspa-consensus-core = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v1.1.0" }
+kaspa-hashes = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v1.1.0" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+
+# gRPC server
+tonic = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+
+# Config & serialization
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+[build-dependencies]
+tonic-build = "0.12"
