@@ -1897,8 +1897,10 @@ dependencies = [
 name = "kaspa-ingestor"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
  "clap",
  "env_logger",
+ "hex",
  "kaspa-consensus-core",
  "kaspa-hashes",
  "kaspa-rpc-core",
@@ -1908,6 +1910,7 @@ dependencies = [
  "prost-types",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tokio-stream",
  "toml",

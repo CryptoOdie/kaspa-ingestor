@@ -18,8 +18,9 @@ service KaspaIngestor {
 // === SUBSCRIBE ===
 
 message SubscribeRequest {
-  // Empty for now — subscribe to everything.
-  // Future: filters (block-only, tx-only, address set, etc.)
+  // If > 0, replay events from this sequence before switching to live stream.
+  // If the sequence is too old (not in replay buffer), server returns OUT_OF_RANGE.
+  uint64 resume_from_sequence = 1;
 }
 
 // === EVENTS ===
@@ -27,6 +28,7 @@ message SubscribeRequest {
 message IngestorEvent {
   uint64 sequence = 1;  // Monotonic sequence number for ordering / gap detection
   uint64 timestamp_ms = 2;  // When the ingestor produced this event
+  bytes prev_event_hash = 3;  // SHA-256 of previous event's serialized bytes (hash chain)
 
   oneof event {
     ChainBlockEvent chain_block = 10;

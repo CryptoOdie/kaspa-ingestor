@@ -10,7 +10,9 @@ Un-opinionated Kaspa blockchain data ingestor. Connects to a rusty-kaspa node vi
 │    node      │                 │                   │                │  indexer,    │
 └──────────────┘                 │  • VSPCv2 poller  │                │  analytics,  │
                                  │  • checkpoint     │                │  wallet...   │
-                                 │  • gRPC server    │                └──────────────┘
+                                 │  • replay buffer  │                └──────────────┘
+                                 │  • hash chain     │
+                                 │  • gRPC server    │
                                  └──────────────────┘
 ```
 
@@ -31,13 +33,17 @@ All configuration lives in `config.toml`:
 ```toml
 [node]
 # wRPC URL of a rusty-kaspa node
-url = "wss://wrpc.kasia.fyi"
+url = "ws://127.0.0.1:17110"
 # Network: "mainnet", "testnet-10", "testnet-11"
 network = "mainnet"
 
 [grpc]
 # Address for the gRPC streaming server
 bind_address = "0.0.0.0:50051"
+# Number of recent events kept in memory for consumer resume (~80 min at 10 BPS)
+replay_buffer_size = 50000
+# Path to persist replay buffer on shutdown (for resume across restarts)
+replay_buffer_path = "replay_buffer.bin"
 
 [ingest]
 # VSPCv2 polling interval in milliseconds
@@ -71,17 +77,33 @@ The checkpoint write is atomic (write to `.tmp`, then rename) to prevent corrupt
 
 To disable checkpointing, set `checkpoint_path = ""` in your config.
 
+## Replay Buffer
+
+The ingestor maintains a bounded ring buffer of recent events in memory (default 50,000 events, roughly 80 minutes at 10 BPS). This allows gRPC consumers to resume from their last seen sequence number without a full resync.
+
+- On shutdown (Ctrl+C), the buffer is serialized to disk as `replay_buffer.bin` using protobuf length-delimited encoding.
+- On startup, the snapshot is restored so consumers can resume even across ingestor restarts.
+- If a consumer requests a sequence older than the buffer, the server returns an `OUT_OF_RANGE` error.
+
+To disable replay buffer persistence, set `replay_buffer_path = ""` in your config.
+
+## Hash Chain
+
+Every `IngestorEvent` includes a `prev_event_hash` field — the SHA-256 hash of the previous event's serialized protobuf bytes. This forms a tamper-evident hash chain that consumers can verify to ensure no events were dropped or modified. The first event uses a zero hash. The hash chain state is persisted in the checkpoint file for continuity across restarts.
+
 ## gRPC API
 
 The protobuf schema is in `proto/kaspa_ingestor.proto`. Three RPCs are available:
 
 ### `Subscribe` (bidirectional stream)
 
-Streams `IngestorEvent` messages to the client. Each event contains a monotonic sequence number for gap detection and one of:
+Streams `IngestorEvent` messages to the client. Each event contains a monotonic sequence number, a `prev_event_hash` for hash chain verification, and one of:
 
 - **`ChainBlockEvent`** — A newly accepted chain block with its header and full transaction data (inputs, outputs, UTXO entries when available).
 - **`ReorgEvent`** — Block hashes removed from the virtual selected parent chain during a reorg.
 - **`StatusEvent`** — Periodic heartbeat with DAA score, block/tx counts.
+
+Consumers can send a `SubscribeRequest` with `resume_from_sequence` to replay buffered events before switching to the live stream. The handoff is seamless with automatic deduplication. If a consumer falls behind the broadcast buffer, they receive a `DATA_LOSS` error and should reconnect with their last sequence.
 
 ### `Ping` (unary)
 
@@ -104,6 +126,9 @@ grpcurl -plaintext localhost:50051 kaspa.ingestor.KaspaIngestor/Ping
 
 # Subscribe to events (streams indefinitely)
 grpcurl -plaintext -d '{}' localhost:50051 kaspa.ingestor.KaspaIngestor/Subscribe
+
+# Resume from a specific sequence number
+grpcurl -plaintext -d '{"resume_from_sequence": 12345}' localhost:50051 kaspa.ingestor.KaspaIngestor/Subscribe
 ```
 
 Or use any gRPC client with the proto file at `proto/kaspa_ingestor.proto`.

@@ -1,8 +1,9 @@
 /// Ingestion loop: connects to a rusty-kaspa node via wRPC and polls
 /// the virtual chain for accepted blocks and transactions using VSPCv2.
+use std::collections::VecDeque;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use kaspa_rpc_core::api::rpc::RpcApi;
@@ -14,6 +15,8 @@ use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
+use prost::Message;
+
 use crate::config::Config;
 use crate::normalize;
 use crate::proto;
@@ -23,6 +26,9 @@ pub struct Checkpoint {
     pub hash: String,
     pub sequence: u64,
     pub timestamp: u64,
+    /// Hex-encoded SHA-256 of the last event (for hash chain continuity across restarts)
+    #[serde(default)]
+    pub prev_event_hash: String,
 }
 
 impl Checkpoint {
@@ -40,11 +46,12 @@ impl Checkpoint {
         Some(cp)
     }
 
-    pub fn save(path: &str, hash: &str, sequence: u64) {
+    pub fn save(path: &str, hash: &str, sequence: u64, prev_event_hash: &[u8; 32]) {
         let cp = Checkpoint {
             hash: hash.to_string(),
             sequence,
             timestamp: Self::now_epoch(),
+            prev_event_hash: hex::encode(prev_event_hash),
         };
         let json = match serde_json::to_string_pretty(&cp) {
             Ok(j) => j,
@@ -86,10 +93,115 @@ impl IngestorMetrics {
     }
 }
 
+/// Bounded ring buffer of recent events for consumer replay/resume.
+pub struct ReplayBuffer {
+    buffer: Mutex<VecDeque<proto::IngestorEvent>>,
+    capacity: usize,
+}
+
+impl ReplayBuffer {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            buffer: Mutex::new(VecDeque::with_capacity(capacity)),
+            capacity,
+        }
+    }
+
+    /// Append an event to the ring buffer, evicting the oldest if at capacity.
+    pub fn push(&self, event: proto::IngestorEvent) {
+        let mut buf = self.buffer.lock().unwrap();
+        if buf.len() >= self.capacity {
+            buf.pop_front();
+        }
+        buf.push_back(event);
+    }
+
+    /// Serialize the entire buffer to disk using protobuf length-delimited encoding.
+    pub fn save_snapshot(&self, path: &str) {
+        let buf = self.buffer.lock().unwrap();
+        let mut out = Vec::new();
+        for event in buf.iter() {
+            event.encode_length_delimited(&mut out).ok();
+        }
+        let tmp = format!("{}.tmp", path);
+        if let Err(e) = std::fs::write(&tmp, &out) {
+            error!("Failed to write replay buffer snapshot: {}", e);
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            error!("Failed to rename replay buffer snapshot: {}", e);
+            let _ = std::fs::remove_file(&tmp);
+            return;
+        }
+        info!("Replay buffer snapshot saved: {} events, {} bytes", buf.len(), out.len());
+    }
+
+    /// Restore the buffer from a protobuf length-delimited snapshot file.
+    pub fn load_snapshot(path: &str, capacity: usize) -> Option<Self> {
+        let data = std::fs::read(path).ok()?;
+        let mut cursor = &data[..];
+        let mut buffer = VecDeque::with_capacity(capacity);
+        while !cursor.is_empty() {
+            match proto::IngestorEvent::decode_length_delimited(&mut cursor) {
+                Ok(event) => buffer.push_back(event),
+                Err(e) => {
+                    warn!("Replay buffer snapshot decode error at event {}: {}", buffer.len(), e);
+                    break;
+                }
+            }
+        }
+        // Trim to capacity (keep newest)
+        while buffer.len() > capacity {
+            buffer.pop_front();
+        }
+        info!("Replay buffer snapshot loaded: {} events from {}", buffer.len(), path);
+        Some(Self {
+            buffer: Mutex::new(buffer),
+            capacity,
+        })
+    }
+
+    /// Get all events with sequence > `from_sequence`.
+    /// Returns `None` if the requested sequence is too old (not in buffer).
+    /// Returns `Some(vec![])` if `from_sequence` is current (no events to replay).
+    pub fn events_since(&self, from_sequence: u64) -> Option<Vec<proto::IngestorEvent>> {
+        let buf = self.buffer.lock().unwrap();
+
+        if buf.is_empty() {
+            // No events in buffer — if they're asking for seq 0 that's fine (no replay),
+            // otherwise we can't satisfy the request.
+            return if from_sequence == 0 { Some(Vec::new()) } else { None };
+        }
+
+        let oldest_seq = buf.front().unwrap().sequence;
+        let newest_seq = buf.back().unwrap().sequence;
+
+        if from_sequence >= newest_seq {
+            // Client is already caught up
+            return Some(Vec::new());
+        }
+
+        if from_sequence < oldest_seq.saturating_sub(1) {
+            // Requested sequence is older than our buffer — can't replay
+            return None;
+        }
+
+        // Find the start position: first event with sequence > from_sequence
+        let events: Vec<proto::IngestorEvent> = buf
+            .iter()
+            .filter(|e| e.sequence > from_sequence)
+            .cloned()
+            .collect();
+
+        Some(events)
+    }
+}
+
 pub async fn run_ingest_loop(
     config: Config,
     event_tx: broadcast::Sender<proto::IngestorEvent>,
     metrics: Arc<IngestorMetrics>,
+    replay_buffer: Arc<ReplayBuffer>,
 ) {
     let poll_interval = Duration::from_millis(config.ingest.poll_interval_ms);
 
@@ -101,6 +213,20 @@ pub async fn run_ingest_loop(
         None
     };
     let mut sequence: u64 = loaded.as_ref().map(|c| c.sequence).unwrap_or(0);
+
+    // Restore hash chain state from checkpoint (or start as zeroes)
+    let mut prev_hash = [0u8; 32];
+    if let Some(ref cp) = loaded {
+        if !cp.prev_event_hash.is_empty() {
+            if let Ok(bytes) = hex::decode(&cp.prev_event_hash) {
+                if bytes.len() == 32 {
+                    prev_hash.copy_from_slice(&bytes);
+                    info!("Restored prev_event_hash from checkpoint");
+                }
+            }
+        }
+    }
+
     let resume_hash: Option<String> = loaded.map(|c| c.hash);
 
     loop {
@@ -111,8 +237,10 @@ pub async fn run_ingest_loop(
             &event_tx,
             &metrics,
             &mut sequence,
+            &mut prev_hash,
             poll_interval,
             resume_hash.as_deref(),
+            &replay_buffer,
         )
         .await
         {
@@ -134,8 +262,10 @@ async fn connect_and_ingest(
     event_tx: &broadcast::Sender<proto::IngestorEvent>,
     metrics: &Arc<IngestorMetrics>,
     sequence: &mut u64,
+    prev_hash: &mut [u8; 32],
     poll_interval: Duration,
     resume_hash: Option<&str>,
+    replay_buffer: &Arc<ReplayBuffer>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let network_id = NetworkId::from_str(&config.node.network)?;
 
@@ -164,7 +294,7 @@ async fn connect_and_ingest(
     );
     metrics.connected.store(true, Ordering::Relaxed);
 
-    ingest_vspc_v2(&client, config, event_tx, metrics, sequence, poll_interval, resume_hash).await
+    ingest_vspc_v2(&client, config, event_tx, metrics, sequence, prev_hash, poll_interval, resume_hash, replay_buffer).await
 }
 
 /// VSPCv2 mode: single get_virtual_chain_from_block_v2 call with Full verbosity
@@ -174,8 +304,10 @@ async fn ingest_vspc_v2(
     event_tx: &broadcast::Sender<proto::IngestorEvent>,
     metrics: &Arc<IngestorMetrics>,
     sequence: &mut u64,
+    prev_hash: &mut [u8; 32],
     poll_interval: Duration,
     resume_hash: Option<&str>,
+    replay_buffer: &Arc<ReplayBuffer>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut start_hash: RpcHash = if let Some(hash_str) = resume_hash {
         RpcHash::from_str(hash_str)?
@@ -213,9 +345,10 @@ async fn ingest_vspc_v2(
                         .map(|cb| cb.accepted_transactions.len())
                         .sum();
 
-                    let events = normalize::normalize_vspc_response(&response, sequence);
+                    let events = normalize::normalize_vspc_response(&response, sequence, prev_hash);
                     for event in &events {
                         let _ = event_tx.send(event.clone());
+                        replay_buffer.push(event.clone());
                     }
 
                     metrics.blocks_processed.fetch_add(added as u64, Ordering::Relaxed);
@@ -233,6 +366,7 @@ async fn ingest_vspc_v2(
                             &config.ingest.checkpoint_path,
                             &start_hash.to_string(),
                             *sequence,
+                            prev_hash,
                         );
                         last_checkpoint = Instant::now();
                     }

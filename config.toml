@@ -1,12 +1,16 @@
 [node]
 # wRPC URL of a rusty-kaspa node
-url = "wss://wrpc.kasia.fyi"
+url = "ws://127.0.0.1:17110"
 # Network: "mainnet", "testnet-10", "testnet-11"
 network = "mainnet"
 
 [grpc]
 # Address for the gRPC streaming server
 bind_address = "0.0.0.0:50051"
+# Number of recent events kept in memory for consumer resume (~80 min at 10 BPS)
+replay_buffer_size = 50000
+# Path to persist replay buffer on shutdown (for resume across restarts)
+replay_buffer_path = "replay_buffer.bin"
 
 [ingest]
 # VSPCv2 polling interval in milliseconds
