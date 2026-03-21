@@ -1,5 +1,7 @@
 /// Converts rusty-kaspa RPC types into our canonical protobuf event types.
 use kaspa_rpc_core::model::message::GetVirtualChainFromBlockV2Response;
+use prost::Message;
+use sha2::{Digest, Sha256};
 
 use crate::proto;
 
@@ -11,9 +13,14 @@ fn now_ms() -> u64 {
 }
 
 /// Convert a VSPCv2 response into a sequence of IngestorEvents.
+///
+/// `prev_hash` is the SHA-256 hash of the previous event's serialized bytes.
+/// It is updated after each event so the caller can pass it into the next call.
+/// First event in the stream should use `[0u8; 32]`.
 pub fn normalize_vspc_response(
     response: &GetVirtualChainFromBlockV2Response,
     sequence: &mut u64,
+    prev_hash: &mut [u8; 32],
 ) -> Vec<proto::IngestorEvent> {
     let mut events = Vec::new();
     let now_ms = now_ms();
@@ -28,11 +35,8 @@ pub fn normalize_vspc_response(
                 .collect(),
         };
         *sequence += 1;
-        events.push(proto::IngestorEvent {
-            sequence: *sequence,
-            timestamp_ms: now_ms,
-            event: Some(proto::ingestor_event::Event::Reorg(reorg)),
-        });
+        let event = build_event(*sequence, now_ms, prev_hash, proto::ingestor_event::Event::Reorg(reorg));
+        events.push(event);
     }
 
     // Emit a ChainBlockEvent for each accepted chain block
@@ -50,21 +54,41 @@ pub fn normalize_vspc_response(
             .map(|h| h.as_bytes().to_vec())
             .unwrap_or_default();
 
-        let event = proto::ChainBlockEvent {
+        let block_event = proto::ChainBlockEvent {
             block_hash,
             header: Some(header),
             accepted_transactions: accepted_txs,
         };
 
         *sequence += 1;
-        events.push(proto::IngestorEvent {
-            sequence: *sequence,
-            timestamp_ms: now_ms,
-            event: Some(proto::ingestor_event::Event::ChainBlock(event)),
-        });
+        let event = build_event(*sequence, now_ms, prev_hash, proto::ingestor_event::Event::ChainBlock(block_event));
+        events.push(event);
     }
 
     events
+}
+
+/// Build an IngestorEvent with hash chain. Sets `prev_event_hash` from the
+/// current `prev_hash`, then updates `prev_hash` to this event's hash.
+fn build_event(
+    sequence: u64,
+    timestamp_ms: u64,
+    prev_hash: &mut [u8; 32],
+    event: proto::ingestor_event::Event,
+) -> proto::IngestorEvent {
+    let ingestor_event = proto::IngestorEvent {
+        sequence,
+        timestamp_ms,
+        prev_event_hash: prev_hash.to_vec(),
+        event: Some(event),
+    };
+
+    // Hash this event's serialized bytes to become the next event's prev_event_hash
+    let serialized = ingestor_event.encode_to_vec();
+    let hash = Sha256::digest(&serialized);
+    *prev_hash = hash.into();
+
+    ingestor_event
 }
 
 fn convert_optional_header(h: &kaspa_rpc_core::RpcOptionalHeader) -> proto::BlockHeader {

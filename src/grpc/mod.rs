@@ -15,13 +15,14 @@ use tokio_stream::Stream;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::config::Config;
-use crate::ingest::IngestorMetrics;
+use crate::ingest::{IngestorMetrics, ReplayBuffer};
 use crate::proto;
 use crate::proto::kaspa_ingestor_server::{KaspaIngestor, KaspaIngestorServer};
 
 pub struct IngestorGrpcService {
     event_tx: broadcast::Sender<proto::IngestorEvent>,
     metrics: Arc<IngestorMetrics>,
+    replay_buffer: Arc<ReplayBuffer>,
     config: Config,
 }
 
@@ -29,11 +30,13 @@ impl IngestorGrpcService {
     pub fn new(
         event_tx: broadcast::Sender<proto::IngestorEvent>,
         metrics: Arc<IngestorMetrics>,
+        replay_buffer: Arc<ReplayBuffer>,
         config: Config,
     ) -> Self {
         Self {
             event_tx,
             metrics,
+            replay_buffer,
             config,
         }
     }
@@ -51,24 +54,95 @@ impl KaspaIngestor for IngestorGrpcService {
 
     async fn subscribe(
         &self,
-        _request: Request<Streaming<proto::SubscribeRequest>>,
+        request: Request<Streaming<proto::SubscribeRequest>>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
+        // Read the first message from the client stream to get resume_from_sequence
+        let mut inbound = request.into_inner();
+        let resume_from_sequence = match inbound.message().await {
+            Ok(Some(req)) => req.resume_from_sequence,
+            Ok(None) => 0,
+            Err(_) => 0,
+        };
+
+        // Subscribe to the broadcast channel BEFORE replaying so we don't miss
+        // events between replay and live.
         let rx = self.event_tx.subscribe();
         info!(
-            "New gRPC subscriber (total: {})",
-            self.event_tx.receiver_count()
+            "New gRPC subscriber (total: {}, resume_from: {})",
+            self.event_tx.receiver_count(),
+            resume_from_sequence
         );
 
-        let stream = BroadcastStream::new(rx);
-        let mapped = tokio_stream::StreamExt::filter_map(stream, |result| match result {
-            Ok(event) => Some(Ok(event)),
-            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
-                warn!("Client lagged, skipped {} events", n);
-                None
+        // Build replay prefix if requested
+        let replay_events = if resume_from_sequence > 0 {
+            match self.replay_buffer.events_since(resume_from_sequence) {
+                Some(events) => {
+                    info!("Replaying {} events from sequence {}", events.len(), resume_from_sequence);
+                    events
+                }
+                None => {
+                    return Err(Status::out_of_range(format!(
+                        "Sequence {} is too old and no longer in the replay buffer. Resync from scratch.",
+                        resume_from_sequence
+                    )));
+                }
             }
-        });
+        } else {
+            Vec::new()
+        };
 
-        Ok(Response::new(Box::pin(mapped)))
+        // Determine the highest sequence we replayed so we can deduplicate
+        let replay_max_seq = replay_events.last().map(|e| e.sequence).unwrap_or(0);
+
+        // Create the replay stream prefix
+        let replay_stream = tokio_stream::iter(
+            replay_events.into_iter().map(Ok)
+        );
+
+        // Live broadcast stream with error-on-lag
+        let live_stream = BroadcastStream::new(rx);
+        let dedup_seq = replay_max_seq;
+        let mapped_live = async_stream::stream! {
+            use tokio_stream::StreamExt;
+            let mut stream = live_stream;
+            while let Some(result) = stream.next().await {
+                match result {
+                    Ok(event) => {
+                        // Skip events already sent during replay
+                        if event.sequence <= dedup_seq {
+                            continue;
+                        }
+                        yield Ok(event);
+                    }
+                    Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                        warn!("Client lagged by {} events, disconnecting", n);
+                        yield Err(tonic::Status::data_loss(
+                            format!("Lagged by {} events. Reconnect and resume from your last sequence.", n)
+                        ));
+                        return;
+                    }
+                }
+            }
+        };
+
+        // Chain replay then live
+        let combined = async_stream::stream! {
+            use tokio_stream::StreamExt;
+
+            // First: replay events
+            let mut replay = std::pin::pin!(replay_stream);
+            while let Some(item) = replay.next().await {
+                yield item;
+            }
+
+            // Then: live events
+            let mut live = std::pin::pin!(mapped_live);
+            while let Some(item) = live.next().await {
+                yield item;
+            }
+        };
+
+        Ok(Response::new(Box::pin(combined)))
     }
 
     async fn ping(
@@ -99,10 +173,11 @@ pub async fn start_grpc_server(
     config: Config,
     event_tx: broadcast::Sender<proto::IngestorEvent>,
     metrics: Arc<IngestorMetrics>,
+    replay_buffer: Arc<ReplayBuffer>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = config.grpc.bind_address.parse()?;
 
-    let service = IngestorGrpcService::new(event_tx, metrics, config);
+    let service = IngestorGrpcService::new(event_tx, metrics, replay_buffer, config);
 
     info!("gRPC server listening on {}", addr);
 

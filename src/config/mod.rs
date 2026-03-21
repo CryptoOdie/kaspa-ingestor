@@ -19,6 +19,14 @@ pub struct NodeConfig {
 pub struct GrpcConfig {
     /// Address to bind the gRPC server (e.g., "0.0.0.0:50051")
     pub bind_address: String,
+
+    /// Number of recent events to keep in the replay buffer for consumer resume
+    #[serde(default = "default_replay_buffer_size")]
+    pub replay_buffer_size: usize,
+
+    /// Path to persist the replay buffer snapshot on shutdown
+    #[serde(default = "default_replay_buffer_path")]
+    pub replay_buffer_path: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -54,6 +62,14 @@ fn default_checkpoint_path() -> String {
 
 fn default_checkpoint_interval() -> u64 {
     60
+}
+
+fn default_replay_buffer_size() -> usize {
+    50_000
+}
+
+fn default_replay_buffer_path() -> String {
+    "replay_buffer.bin".to_string()
 }
 
 impl Config {
